@@ -1,104 +1,137 @@
 import time
+import random
 import re
 from typing import List, Set, Optional, Literal
+import datetime
 
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
 import streamlit as st
+import plotly.express as px  # 시계열 차트를 예쁘게 그리기 위해 추가
 
+# KoNLPy (형태소 분석기) 임포트
+# Java가 설치되어 있어야 작동합니다.
+try:
+    from konlpy.tag import Okt
+except ImportError:
+    st.error("KoNLPy가 설치되지 않았습니다. 'pip install konlpy'를 실행하세요.")
+except Exception as e:
+    st.error(f"KoNLPy 초기화 오류 (Java 설치 확인 필요): {e}")
 
 # -----------------------------
-# 전역 설정
+# 1. 설정 및 불용어
 # -----------------------------
 
-# 아주 기본적인 불용어 (필요할 때 추가해가면 됨)
+# 주식 커뮤니티용 확장 불용어
 DEFAULT_STOPWORDS: Set[str] = {
     "그냥", "근데", "그리고", "또", "좀", "이거", "저거", "거의",
-    "지금", "오늘", "내일", "어제", "그럼", "제발",
-    "the", "and", "or", "but", "a", "an", "to", "of",
+    "지금", "오늘", "내일", "어제", "그럼", "제발", "진짜", "존나", 
+    "시발", "병신", "형들", "형님", "개추", "비추", "정도", "때문", 
+    "사람", "생각", "무슨", "어떻게", "왜", "다시", "계속", "나", "너", "우리",
+    "하나", "지금", "보고", "가지", "달러", "주식", "시장"
 }
 
-# 숫자/영문/한글/초성까지 허용
-TOKEN_PATTERN = re.compile(r"[0-9A-Za-z가-힣ㄱ-ㅎㅏ-ㅣ]+")
-
-
 # -----------------------------
-# 1. 텍스트 토큰화
+# 2. 텍스트 처리 (형태소 분석 적용)
 # -----------------------------
 
-def tokenize_text(
+@st.cache_resource
+def get_tokenizer():
+    """
+    Okt 인스턴스는 로딩에 시간이 걸리므로 캐싱하여 사용
+    """
+    return Okt()
+
+def tokenize_text_korean(
     text: str,
     stopwords: Optional[Set[str]] = None,
     min_len: int = 2,
 ) -> List[str]:
     """
-    게시글 텍스트를 단어 리스트로 변환.
-    - 영문은 소문자로
-    - min_len 이하 토큰 제거
-    - stopwords 제거
+    KoNLPy(Okt)를 사용하여 명사만 추출.
+    - 교착어 특성상 단순 띄어쓰기가 아닌 '명사' 추출이 핵심.
     """
     if not isinstance(text, str):
         return []
+    
     stopwords = stopwords or set()
-    tokens: List[str] = []
+    
+    # 1. 기본적인 정제 (특수문자 제거 등)
+    # 한글, 영문, 숫자만 남기고 제거
+    cleaned_text = re.sub(r"[^가-힣a-zA-Z0-9\s]", " ", text)
+    
+    # 2. 형태소 분석 (명사 추출)
+    try:
+        okt = get_tokenizer()
+        nouns = okt.nouns(cleaned_text) # 명사만 추출
+    except Exception:
+        # Java 오류 등으로 실패 시 간단한 split으로 대체 (Fall-back)
+        nouns = cleaned_text.split()
 
-    for match in TOKEN_PATTERN.finditer(text):
-        token = match.group(0)
+    # 3. 영문 처리 (Okt는 영문을 잘 못 잡을 수 있으므로 별도 추출해서 합칠 수도 있음)
+    # 여기서는 간단히 Okt 결과 + 원문의 영단어(소문자)를 병합하는 방식 사용
+    english_tokens = re.findall(r"[a-zA-Z]+", text)
+    english_tokens = [t.lower() for t in english_tokens]
+    
+    # 4. 최종 필터링
+    final_tokens = []
+    
+    # 한글 명사 필터링
+    for n in nouns:
+        if len(n) >= min_len and n not in stopwords:
+            final_tokens.append(n)
+            
+    # 영문 토큰 필터링
+    for e in english_tokens:
+        if len(e) >= min_len and e not in stopwords:
+            final_tokens.append(e)
 
-        # 영문은 소문자로
-        if re.fullmatch(r"[A-Za-z]+", token):
-            token = token.lower()
-
-        if len(token) < min_len:
-            continue
-        if token in stopwords:
-            continue
-
-        tokens.append(token)
-
-    return tokens
+    return final_tokens
 
 
 # -----------------------------
-# 2. 디씨 미주갤 크롤러 (간단 버전)
+# 3. 크롤러 (차단 방지 기능 추가)
 # -----------------------------
 
-def crawl_dc_minor(
+def crawl_dc_minor_v2(
     gallery_id: str,
     start_page: int,
     end_page: int,
-    delay: float = 1.0,
+    min_delay: float = 0.5,
+    max_delay: float = 1.5,
 ) -> pd.DataFrame:
     """
-    디시 마이너 갤러리(list → 글 본문)를 간단 크롤링.
-
-    - gallery_id 예: 'us_stock' (실제 갤 주소 확인 필요)
-    - start_page, end_page: 리스트 페이지 범위 (1부터 시작)
-    - 너무 큰 범위 넣으면 오래 걸리고, 사이트에 부담 줄 수 있으니 적당히.
+    디시 마이너 갤러리 크롤링 (랜덤 딜레이 적용)
     """
+    # User-Agent를 일반 브라우저처럼 위장
     headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; stock-sentiment-bot/0.1; +https://example.com)"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
 
     rows = []
-
-    for page in range(start_page, end_page + 1):
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    total_pages = end_page - start_page + 1
+    
+    for idx, page in enumerate(range(start_page, end_page + 1)):
+        status_text.text(f"현재 {page}페이지 수집 중...")
+        progress_bar.progress((idx) / total_pages)
+        
         list_url = f"https://gall.dcinside.com/mgallery/board/lists/?id={gallery_id}&page={page}"
+        
         try:
             res = requests.get(list_url, headers=headers, timeout=10)
             res.raise_for_status()
         except Exception as e:
-            st.warning(f"리스트 페이지 {page} 요청 실패: {e}")
+            st.warning(f"페이지 {page} 접속 실패: {e}")
             continue
 
         soup = BeautifulSoup(res.text, "html.parser")
-
-        # 게시글 행 선택 (클래스명은 실제 HTML 보고 필요하면 조정)
         trs = soup.select("tr.ub-content.us-post") or soup.select("tr.ub-content")
 
         for tr in trs:
-            # 제목, 링크
             a_tag = tr.select_one("a.ub-word")
             if a_tag is None:
                 continue
@@ -107,382 +140,225 @@ def crawl_dc_minor(
             href = a_tag.get("href")
             if not href:
                 continue
-
+            
             # 링크 보정
             if href.startswith("//"):
-                href = "https:" + href
+                post_url = "https:" + href
             elif href.startswith("/"):
-                href = "https://gall.dcinside.com" + href
-            post_url = href
-
-            # 작성 시각 (리스트에 있는 경우)
-            date_td = tr.select_one("td.gall_date")
-            if date_td is None:
-                timestamp_text = ""
+                post_url = "https://gall.dcinside.com" + href
             else:
-                # 보통 title 속성에 전체 시각, 텍스트에는 시/날짜 일부만 있음
-                timestamp_text = date_td.get("title") or date_td.get_text(strip=True)
+                post_url = href
 
-            # 글 본문 요청
+            # 날짜
+            date_td = tr.select_one("td.gall_date")
+            timestamp_text = date_td.get("title") or date_td.get_text(strip=True) if date_td else ""
+
+            # 본문 수집 (랜덤 딜레이)
             content_text = ""
             try:
-                time.sleep(delay)
-                pres = requests.get(post_url, headers=headers, timeout=10)
-                pres.raise_for_status()
-                psoup = BeautifulSoup(pres.text, "html.parser")
-                # 본문 영역 (역시 실제 HTML 보고 클래스명 조정 가능)
-                content_div = psoup.select_one("div.write_div")
-                if content_div:
-                    content_text = content_div.get_text(separator=" ", strip=True)
-            except Exception as e:
-                st.warning(f"본문 요청 실패: {post_url}, 오류: {e}")
+                # 너무 빠르지 않게 쉼
+                time.sleep(random.uniform(min_delay, max_delay))
+                
+                pres = requests.get(post_url, headers=headers, timeout=5)
+                if pres.status_code == 200:
+                    psoup = BeautifulSoup(pres.text, "html.parser")
+                    content_div = psoup.select_one("div.write_div")
+                    if content_div:
+                        content_text = content_div.get_text(separator=" ", strip=True)
+            except Exception:
+                pass # 본문 실패해도 제목이라도 건짐
 
-            rows.append(
-                {
-                    "timestamp_raw": timestamp_text,
-                    "title": title,
-                    "content": content_text,
-                    "url": post_url,
-                    "page": page,
-                }
-            )
+            rows.append({
+                "timestamp_str": timestamp_text,
+                "title": title,
+                "content": content_text,
+                "url": post_url
+            })
+            
+        # 페이지 넘어갈 때도 딜레이
+        time.sleep(random.uniform(min_delay, max_delay))
 
-        time.sleep(delay)
-
+    progress_bar.progress(1.0)
+    status_text.text("수집 완료!")
+    
     if not rows:
-        return pd.DataFrame(columns=["timestamp", "title", "content", "url", "page"])
+        return pd.DataFrame()
 
     df = pd.DataFrame(rows)
-
-    # timestamp 파싱 (형식이 다를 수 있어서 몇 가지 패턴 시도)
-    def parse_ts(x: str):
-        import datetime as dt
-        x = (x or "").strip()
-        for fmt in ("%Y.%m.%d %H:%M", "%Y-%m-%d %H:%M", "%Y.%m.%d", "%Y-%m-%d"):
+    
+    # 날짜 파싱 로직
+    def parse_ts(x):
+        x = str(x).strip()
+        patterns = ["%Y.%m.%d %H:%M:%S", "%Y.%m.%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"]
+        for pat in patterns:
             try:
-                return dt.datetime.strptime(x, fmt)
-            except Exception:
+                return pd.to_datetime(x, format=pat)
+            except:
                 continue
+        # 오늘 날짜(HH:mm)인 경우 처리 등은 생략하고 NaT 처리
         return pd.NaT
 
-    df["timestamp"] = df["timestamp_raw"].apply(parse_ts)
-    df = df.dropna(subset=["timestamp"]).reset_index(drop=True)
-
-    return df[["timestamp", "title", "content", "url", "page"]]
-
-
-# -----------------------------
-# 3. 일자별 단어 통계 만들기
-# -----------------------------
-
-def build_daily_word_stats(
-    df_posts: pd.DataFrame,
-    stopwords: Optional[Set[str]] = None,
-    min_len: int = 2,
-) -> pd.DataFrame:
-    """
-    raw posts DataFrame → (date, word) 단위 일자별 통계로 변환
-    """
-    if df_posts.empty:
-        return pd.DataFrame(
-            columns=["date", "word", "count", "freq", "total_words", "total_posts"]
-        )
-
-    df = df_posts.copy()
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df["timestamp"] = df["timestamp_str"].apply(parse_ts)
+    # 날짜 파싱 실패한 행(오래된 글이나 형식 다른 글) 제거 혹은 오늘 날짜로 가정
+    df = df.dropna(subset=["timestamp"])
     df["date"] = df["timestamp"].dt.date
+    
+    return df
 
-    # title + content 합치기
-    df["text"] = (
-        df.get("title", "").fillna("").astype(str)
-        + " "
-        + df.get("content", "").fillna("").astype(str)
-    )
 
-    df["tokens"] = df["text"].apply(
-        lambda x: tokenize_text(x, stopwords=stopwords or DEFAULT_STOPWORDS, min_len=min_len)
-    )
-    df["token_count"] = df["tokens"].apply(len)
+# -----------------------------
+# 4. 통계 생성 (일자별)
+# -----------------------------
 
-    daily_stats = []
-
-    for date, grp in df.groupby("date"):
-        total_posts = len(grp)
-        total_words = int(grp["token_count"].sum())
-
-        exploded = grp[["tokens"]].explode("tokens")
-        exploded = exploded.dropna(subset=["tokens"])
-
-        if exploded.empty:
-            continue
-
-        word_group = exploded.groupby("tokens", as_index=False).size()
-        word_group = word_group.rename(columns={"tokens": "word", "size": "count"})
-
-        if total_words > 0:
-            word_group["freq"] = word_group["count"] / total_words
-        else:
-            word_group["freq"] = 0.0
-
-        word_group["date"] = date
-        word_group["total_words"] = total_words
-        word_group["total_posts"] = total_posts
-
-        daily_stats.append(word_group)
-
-    if not daily_stats:
-        return pd.DataFrame(
-            columns=["date", "word", "count", "freq", "total_words", "total_posts"]
-        )
-
-    df_daily = pd.concat(daily_stats, ignore_index=True)
-    df_daily = df_daily[["date", "word", "count", "freq", "total_words", "total_posts"]]
+def build_stats_v2(df_posts: pd.DataFrame):
+    """
+    데이터프레임을 받아 (date, word) 빈도 테이블 생성
+    """
+    all_rows = []
+    
+    # 진행 상황 표시
+    prog = st.progress(0)
+    total_len = len(df_posts)
+    
+    for i, row in df_posts.iterrows():
+        if i % 10 == 0:
+            prog.progress(min(i / total_len, 1.0))
+            
+        full_text = str(row["title"]) + " " + str(row["content"])
+        tokens = tokenize_text_korean(full_text, stopwords=DEFAULT_STOPWORDS)
+        
+        for token in tokens:
+            all_rows.append({
+                "date": row["date"],
+                "word": token
+            })
+            
+    prog.progress(1.0)
+            
+    if not all_rows:
+        return pd.DataFrame()
+        
+    df_tokens = pd.DataFrame(all_rows)
+    
+    # 날짜별, 단어별 카운트
+    df_daily = df_tokens.groupby(["date", "word"]).size().reset_index(name="count")
+    
+    # 해당 날짜의 총 단어 수 계산 (빈도율 freq 계산용)
+    daily_total = df_tokens.groupby("date").size().reset_index(name="total_words")
+    df_daily = df_daily.merge(daily_total, on="date", how="left")
+    df_daily["freq"] = df_daily["count"] / df_daily["total_words"]
+    
     return df_daily
 
 
 # -----------------------------
-# 4. 조회 함수들
-# -----------------------------
-
-def get_range_word_stats(
-    df_daily: pd.DataFrame,
-    start_date: str,
-    end_date: str,
-    min_days: int = 1,
-    top_n: int = 50,
-    sort_by: Literal["sum_count", "avg_freq", "max_freq"] = "sum_count",
-) -> pd.DataFrame:
-    """
-    특정 기간 [start_date, end_date] 내에서 단어별 집계
-    """
-    df = df_daily.copy()
-    if not pd.api.types.is_string_dtype(df["date"]):
-        df["date"] = df["date"].astype(str)
-
-    mask = (df["date"] >= start_date) & (df["date"] <= end_date)
-    sub = df.loc[mask]
-
-    if sub.empty:
-        return pd.DataFrame()
-
-    grouped = (
-        sub.groupby("word")
-        .agg(
-            sum_count=("count", "sum"),
-            days_appeared=("date", "nunique"),
-            avg_freq=("freq", "mean"),
-            max_freq=("freq", "max"),
-        )
-        .reset_index()
-    )
-
-    grouped = grouped[grouped["days_appeared"] >= min_days]
-
-    if grouped.empty:
-        return grouped
-
-    if sort_by == "sum_count":
-        grouped = grouped.sort_values("sum_count", ascending=False)
-    elif sort_by == "avg_freq":
-        grouped = grouped.sort_values("avg_freq", ascending=False)
-    elif sort_by == "max_freq":
-        grouped = grouped.sort_values("max_freq", ascending=False)
-    else:
-        raise ValueError(f"invalid sort_by: {sort_by}")
-
-    if top_n and top_n > 0:
-        grouped = grouped.head(top_n)
-
-    return grouped
-
-
-def get_day_word_stats(
-    df_daily: pd.DataFrame,
-    target_date: str,
-    min_count: int = 1,
-    top_n: int = 100,
-    sort_by: Literal["count", "freq"] = "count",
-) -> pd.DataFrame:
-    """
-    특정 날짜의 단어 분포 조회
-    """
-    df = df_daily.copy()
-    if not pd.api.types.is_string_dtype(df["date"]):
-        df["date"] = df["date"].astype(str)
-
-    sub = df[df["date"] == target_date]
-
-    if sub.empty:
-        return pd.DataFrame()
-
-    sub = sub[sub["count"] >= min_count]
-
-    if sub.empty:
-        return sub
-
-    if sort_by == "count":
-        sub = sub.sort_values("count", ascending=False)
-    elif sort_by == "freq":
-        sub = sub.sort_values("freq", ascending=False)
-    else:
-        raise ValueError(f"invalid sort_by: {sort_by}")
-
-    if top_n and top_n > 0:
-        sub = sub.head(top_n)
-
-    return sub.reset_index(drop=True)
-
-
-# -----------------------------
-# 5. Streamlit UI
+# 5. 메인 UI
 # -----------------------------
 
 def main():
-    st.set_page_config(page_title="디씨 미주갤 단어 관찰실", layout="wide")
-    st.title("📊 디씨 미국 주식 마이너 갤러리 · 단어 관찰 실험실 (V1)")
+    st.set_page_config(page_title="주식 심리 분석기 V2", layout="wide")
+    
+    st.title("🧠 주식 커뮤니티 심리 분석기 V2")
+    st.caption("디시인사이드 미주갤 데이터 기반 · KoNLPy 형태소 분석 · 시계열 트렌드 추적")
 
-    # ----------------- 사이드바: 데이터 준비 -----------------
-    st.sidebar.header("1. 데이터 준비")
+    # 세션 상태 초기화
+    if "df_posts" not in st.session_state:
+        st.session_state["df_posts"] = pd.DataFrame()
+    if "df_daily" not in st.session_state:
+        st.session_state["df_daily"] = pd.DataFrame()
 
-    st.sidebar.markdown("**옵션 A. CSV 업로드 (raw_posts)**")
-    uploaded = st.sidebar.file_uploader("raw_posts CSV 업로드", type=["csv"])
-
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("**옵션 B. 앱에서 직접 크롤링 (실험용)**")
-    gallery_id = st.sidebar.text_input("갤러리 ID", value="stockus")
-    start_page = st.sidebar.number_input("시작 페이지", min_value=1, value=1, step=1)
-    end_page = st.sidebar.number_input("끝 페이지", min_value=1, value=2, step=1)
-    delay = st.sidebar.number_input("요청 간격(초)", min_value=0.0, value=1.0, step=0.5)
-
-    crawl_button = st.sidebar.button("디씨에서 크롤링 실행")
-
-    df_posts: Optional[pd.DataFrame] = None
-
-    # CSV 업로드 우선
-    if uploaded is not None:
-        df_posts = pd.read_csv(uploaded)
-        st.success(f"CSV 업로드 완료: {len(df_posts)} rows")
-
-    # 크롤링 실행 시
-    if crawl_button:
-        with st.spinner("디씨 미주갤에서 글 수집 중... (페이지 수가 많으면 오래 걸림)"):
-            df_crawled = crawl_dc_minor(
-                gallery_id=gallery_id,
-                start_page=int(start_page),
-                end_page=int(end_page),
-                delay=float(delay),
-            )
-        if df_crawled.empty:
-            st.error("크롤링 결과가 비어 있습니다. 갤러리 ID / 페이지 범위를 확인하세요.")
-        else:
-            st.success(f"크롤링 완료: {len(df_crawled)} posts")
-            st.dataframe(df_crawled.head())
-            if df_posts is None:
-                df_posts = df_crawled
+    # --- 사이드바: 데이터 수집 ---
+    with st.sidebar:
+        st.header("1. 데이터 수집")
+        
+        # 갤러리 ID (기본값: 미주갤)
+        gallery_id = st.text_input("갤러리 ID", value="stockus") 
+        col1, col2 = st.columns(2)
+        start_p = col1.number_input("시작 페이지", 1, 1000, 1)
+        end_p = col2.number_input("종료 페이지", 1, 1000, 3) # 테스트용으로 적게 설정
+        
+        if st.button("데이터 크롤링 시작"):
+            with st.spinner("디씨 방문 중... (랜덤 딜레이 적용됨)"):
+                df_new = crawl_dc_minor_v2(gallery_id, start_p, end_p)
+                
+            if not df_new.empty:
+                st.session_state["df_posts"] = df_new
+                st.success(f"{len(df_new)}개 게시글 수집 완료!")
+                
+                # 수집 후 바로 분석 실행
+                with st.spinner("형태소 분석(KoNLPy) 수행 중..."):
+                    df_stats = build_stats_v2(df_new)
+                    st.session_state["df_daily"] = df_stats
+                st.success("분석 데이터 생성 완료!")
             else:
-                # 업로드 + 크롤링 같이 쓰고 싶을 수도 있으니 합치기
-                df_posts = pd.concat([df_posts, df_crawled], ignore_index=True)
+                st.error("수집된 데이터가 없습니다.")
 
-    if df_posts is None or df_posts.empty:
-        st.info("좌측에서 CSV를 업로드하거나, 크롤링을 먼저 실행하세요.")
+    # --- 메인 화면 ---
+    
+    df_daily = st.session_state["df_daily"]
+
+    if df_daily.empty:
+        st.info("👈 사이드바에서 크롤링을 먼저 실행해주세요.")
         return
 
-    # ----------------- 일자별 단어 통계 -----------------
-    st.markdown("### 2. 일자별 단어 통계 생성")
+    # 탭 구성
+    tab1, tab2, tab3 = st.tabs(["📊 주요 키워드(Bar)", "📈 심리/테마 트렌드(Line)", "📝 원본 데이터"])
 
-    if st.checkbox("일자별 단어 통계 새로 계산하기", value=True):
-        with st.spinner("일자별 단어 통계 계산 중..."):
-            df_daily = build_daily_word_stats(df_posts)
-        if df_daily.empty:
-            st.error("일자별 단어 통계를 만들 수 없습니다. 데이터 내용을 확인하세요.")
-            return
-        st.success(f"완료: {df_daily['date'].nunique()}일, {len(df_daily)} (date, word) rows")
-        st.session_state["df_daily"] = df_daily
-    else:
-        df_daily = st.session_state.get("df_daily")
-        if df_daily is None or df_daily.empty:
-            st.warning("저장된 df_daily가 없습니다. 통계를 한 번 계산해 주세요.")
-            return
+    # 1. 주요 키워드 랭킹
+    with tab1:
+        st.subheader("기간 내 최다 언급 단어")
+        
+        top_n = st.slider("상위 N개 보기", 10, 50, 20)
+        
+        # 전체 기간 합산
+        total_counts = df_daily.groupby("word")["count"].sum().reset_index()
+        total_counts = total_counts.sort_values("count", ascending=False).head(top_n)
+        
+        fig = px.bar(total_counts, x="word", y="count", 
+                     title=f"Top {top_n} 키워드", color="count")
+        st.plotly_chart(fig, use_container_width=True)
 
-    # ----------------- 탭: 기간 / 일자 모드 -----------------
-    tab_range, tab_day = st.tabs(["📅 기간 단어 빈도", "📆 특정 날짜 단어 분포"])
+    # 2. 트렌드 분석 (핵심 기능)
+    with tab2:
+        st.subheader("관심 키워드 시계열 추적")
+        st.caption("특정 주식이나 감정 단어가 시간에 따라 어떻게 변하는지 확인하세요.")
+        
+        # 검색 기능
+        all_words = sorted(df_daily["word"].unique())
+        default_keywords = ["테슬라", "엔비디아", "롱", "숏", "졸업", "한강"]
+        # 데이터에 있는 단어만 필터링
+        valid_defaults = [w for w in default_keywords if w in all_words]
+        
+        selected_words = st.multiselect("추적할 단어를 선택/입력하세요", all_words, default=valid_defaults)
+        
+        if selected_words:
+            # 선택된 단어만 필터링
+            mask = df_daily["word"].isin(selected_words)
+            chart_df = df_daily[mask].copy()
+            
+            # 날짜 정렬
+            chart_df = chart_df.sort_values("date")
+            
+            # 라인 차트 그리기
+            # y축을 'freq'(비율)로 하면 게시글 수가 다른 날짜끼리 비교하기 더 좋음
+            metric = st.radio("지표 선택", ["count (단순 횟수)", "freq (언급 밀도)"], index=0)
+            y_col = "count" if "count" in metric else "freq"
+            
+            fig2 = px.line(chart_df, x="date", y=y_col, color="word", markers=True,
+                           title="키워드별 언급 추이 변화")
+            st.plotly_chart(fig2, use_container_width=True)
+            
+            st.markdown("""
+            **💡 분석 팁:**
+            - **급등:** 평소 잠잠하던 종목이 갑자기 언급량이 폭발하면 '재료'가 떴거나 '과열' 징조입니다.
+            - **감정:** '졸업'(수익실현), '한강'(손실) 같은 단어와 종목명의 추이를 겹쳐보세요.
+            """)
+        else:
+            st.info("추적할 단어를 선택해주세요.")
 
-    # ----- 탭 1: 기간 단어 빈도 -----
-    with tab_range:
-        st.subheader("기간 단어 빈도")
-
-        col1, col2 = st.columns(2)
-        min_date = pd.to_datetime(df_daily["date"]).min()
-        max_date = pd.to_datetime(df_daily["date"]).max()
-        with col1:
-            start = st.date_input("시작 날짜", value=min_date, min_value=min_date, max_value=max_date)
-        with col2:
-            end = st.date_input("끝 날짜", value=max_date, min_value=min_date, max_value=max_date)
-
-        col3, col4, col5 = st.columns(3)
-        with col3:
-            min_days = st.number_input("최소 등장 일수", min_value=1, value=1)
-        with col4:
-            top_n = st.number_input("표시 단어 수 (Top N)", min_value=10, max_value=300, value=50, step=10)
-        with col5:
-            sort_by = st.selectbox("정렬 기준", ["sum_count", "avg_freq", "max_freq"])
-
-        if st.button("기간 단어 빈도 조회"):
-            start_str = start.strftime("%Y-%m-%d")
-            end_str = end.strftime("%Y-%m-%d")
-            stats = get_range_word_stats(
-                df_daily,
-                start_date=start_str,
-                end_date=end_str,
-                min_days=int(min_days),
-                top_n=int(top_n),
-                sort_by=sort_by,  # type: ignore[arg-type]
-            )
-            if stats.empty:
-                st.warning("조건에 맞는 단어가 없습니다.")
-            else:
-                st.write(f"선택 기간: {start_str} ~ {end_str}")
-                st.dataframe(stats)
-
-                st.markdown("#### 상위 단어 막대 그래프 (sum_count 기준)")
-                chart_data = stats.set_index("word")["sum_count"]
-                st.bar_chart(chart_data)
-
-    # ----- 탭 2: 특정 날짜 단어 분포 -----
-    with tab_day:
-        st.subheader("특정 날짜 단어 분포")
-
-        all_dates = sorted(pd.to_datetime(df_daily["date"]).unique())
-        default_date = all_dates[-1] if all_dates else None
-        target = st.date_input("날짜 선택", value=default_date)
-
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            min_count = st.number_input("최소 등장 횟수", min_value=1, value=3)
-        with col2:
-            top_n_day = st.number_input("표시 단어 수 (Top N)", min_value=10, max_value=300, value=50, step=10)
-        with col3:
-            sort_by_day = st.selectbox("정렬 기준", ["count", "freq"])
-
-        if st.button("해당 날짜 단어 분포 조회"):
-            t_str = target.strftime("%Y-%m-%d")
-            day_stats = get_day_word_stats(
-                df_daily,
-                target_date=t_str,
-                min_count=int(min_count),
-                top_n=int(top_n_day),
-                sort_by=sort_by_day,  # type: ignore[arg-type]
-            )
-            if day_stats.empty:
-                st.warning("조건에 맞는 단어가 없습니다.")
-            else:
-                st.write(f"선택 날짜: {t_str}")
-                st.dataframe(day_stats)
-
-                st.markdown("#### 단어 막대 그래프")
-                chart_data = day_stats.set_index("word")["count"]
-                st.bar_chart(chart_data)
-
+    # 3. 데이터 확인
+    with tab3:
+        st.dataframe(st.session_state["df_posts"])
 
 if __name__ == "__main__":
     main()
