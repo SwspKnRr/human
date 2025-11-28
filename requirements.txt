@@ -2,5 +2,6 @@ streamlit
 pandas
 requests
 beautifulsoup4
-konlpy
-plotly
+yfinance
+mplfinance
+matplotlib
